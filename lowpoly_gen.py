@@ -7,14 +7,29 @@ import sys
 import multiprocessing
 import time
 
-## config
+# ------------------------------------------------------------------------------
+# -- CONFIG
 INPUT_SVG = "input.svg"     # input SVG file
 REF_IMAGE = "raw.png"        # reference image
 OUTPUT_SVG = "delaunay.svg"  # output SVG file
 
-# adjust these values to trade off speed vs. quality
-SAMPLE_INTERVAL = 20  # sample interval for SVG parsing; less == detailed
-RANDOM_POINTS_COUNT = 3000 # random points count for triangulation
+# -- adjust these values to tweak output
+SAMPLE_INTERVAL = 30  # sample interval for SVG parsing; less == detailed
+RANDOM_POINTS_COUNT = 800 # random points count for triangulation
+
+# when adding random points, we can either:
+# - add them uniformly across the image (normal)
+# - add them based on the existing/sampled points (density sampling)
+USE_DENSITY_SAMPLING = True
+DENSITY_DISTRIBUTION_RATIO = 0.7  # % of points added that are near edges
+DENSITY_SPREAD = 10.0  # spread of points near edges
+
+# jitter the post-triangulation points to make the output look more human-made
+# humans usually don't produce perfect delaunay triangulations
+USE_JITTER = True
+JITTER_PERCENTAGE = 0.9 # % of points to jitter
+JITTER_STRENGTH = 1.5   # max pixel shift
+# ------------------------------------------------------------------------------
 
 ## setup
 global_img_base = None
@@ -114,9 +129,55 @@ def get_points_from_svg(svg_path, sample_interval):
 
 def add_random_points(w, h, count, existing):
     print(f"adding {count} random points...")
-    new_pts = np.random.rand(count, 2) * [w, h]
     corners = np.array([[0,0], [w, 0], [w, h], [0, h]])
-    return np.vstack([existing, new_pts, corners])
+
+    if not USE_DENSITY_SAMPLING:
+        new_pts = np.random.rand(count, 2) * [w, h]
+        return np.vstack([existing, new_pts, corners])
+
+    # density sampling
+    density_count = int(count * DENSITY_DISTRIBUTION_RATIO)
+    uniform_count = count - density_count
+
+    # uniform points
+    uniform_pts = np.random.rand(uniform_count, 2) * [w, h]
+
+    # density points (sample from existing edge points + noise)
+    indices = np.random.choice(len(existing), density_count)
+    base_pts = existing[indices]
+    noise = np.random.normal(0, DENSITY_SPREAD, base_pts.shape)
+    density_pts = base_pts + noise
+
+    # clamp to bounds
+    density_pts[:, 0] = np.clip(density_pts[:, 0], 0, w)
+    density_pts[:, 1] = np.clip(density_pts[:, 1], 0, h)
+
+    return np.vstack([existing, uniform_pts, density_pts, corners])
+
+def apply_jitter(points, w, h):
+    if not USE_JITTER:
+        return points
+
+    print("applying jitter...")
+    
+    jitter_pts = points.copy()
+    num_points = len(points) - 4 # exclude corners
+    
+    # select random subset
+    mask = np.random.random(num_points) < JITTER_PERCENTAGE
+    indices = np.where(mask)[0]
+    
+    offsets = (np.random.rand(len(indices), 2) - 0.5) * 2 * JITTER_STRENGTH
+    jitter_pts[indices] += offsets
+    
+    # clamp
+    jitter_pts[:, 0] = np.clip(jitter_pts[:, 0], 0, w)
+    jitter_pts[:, 1] = np.clip(jitter_pts[:, 1], 0, h)
+    
+    # restore corners exactly, to be safe
+    jitter_pts[-4:] = points[-4:]
+    
+    return jitter_pts
 
 ## main
 if __name__ == "__main__":
@@ -127,7 +188,7 @@ if __name__ == "__main__":
     try:
         ref_img = Image.open(REF_IMAGE).convert("RGB")
     except:
-        print("Image not found"); sys.exit()
+        print("image not found"); sys.exit()
         
     img_array = np.array(ref_img)
     h, w, c = img_array.shape
@@ -142,6 +203,10 @@ if __name__ == "__main__":
     # triangulate
     print("triangulating...")
     tri = Delaunay(all_points)
+    
+    # apply jitter AFTER triangulation to warp the mesh without breaking topology
+    all_points = apply_jitter(all_points, svg_w, svg_h)
+    
     triangles = tri.simplices
     print(f"total triangles: {len(triangles)}")
 
